@@ -1,3 +1,5 @@
+> **Note:** This is the Hibiki fork of Magpie (GPL-3.0). See [HIBIKI-FORK.md](HIBIKI-FORK.md) for the upstream baseline commit, the list of changes, and how our releases differ. Upstream project: https://github.com/Blinue/Magpie
+
 <br>
 <p align="center">
   <img src="./src/Magpie/Icons/SVG/Magpie Icon Full Disabled.svg" width="150px" height="150px" alt="Logo">

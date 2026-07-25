@@ -1,0 +1,185 @@
+# Hibiki 自持 Magpie 产物的构建/发布 workflow（本仓库是 Blinue/Magpie 的 fork）。
+#
+# 为什么要自己编：Hibiki 需要在 galgame 场景里内置窗口超分，且后续可能要改 Magpie 源码
+# （例如让缩放对 Hibiki 的查词浮窗更友好）。上游官方 release 无法承载我们的改动，故 fork
+# 自编自持，照 hajisensai/hibiki-hook 的 helper 分发范式按需下载。
+#
+# 与上游 release.yml 的区别（**不要**把两者混用）：
+# - 上游 release.yml 走 workflow_dispatch + 语义版本 tag + scripts/release.py（会打 git tag、
+#   建 Announcements discussion、回写 version.json），只适合上游发正式版。
+# - 本 workflow 只 upsert **固定 tag** `magpie-hibiki` 的 prerelease，产物文件名不含版本号，
+#   给 Hibiki 客户端一个永远不变的直链；版本信息放 release body 与包内 hibiki-magpie.json。
+# - 上游只提供 MD5（给它自己的更新器用）；我们额外产出 **.sha256 侧车**，Hibiki 用它做
+#   完整性校验和「是否有新版」的判据。
+# - 不签名：签名需要 secrets.MAGPIE_PFX_PASSWORD，fork 没有该 secret。publish.py 仅在传了
+#   --pfx-path 时才签名，所以省略即可（TouchHelper 的 UIAccess 注册会因此不可用，Hibiki
+#   不使用触摸支持）。
+#
+# GPL-3.0 合规：本 fork 必须保持 public、保留完整源码与上游 LICENSE/版权声明；本 workflow
+# 分发的二进制对应的源码就是本仓库同一 commit。
+name: hibiki-magpie-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "要构建的平台（逗号分隔）"
+        default: "x64,ARM64"
+      prerelease:
+        description: "作为 prerelease 发布"
+        type: boolean
+        default: true
+
+# 同一时刻只跑一份发布，避免并发 upsert 同一 release 竞态。
+concurrency:
+  group: hibiki-magpie-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 与上游 build.yml / release.yml 同镜像：Magpie 需要 VS2026 工具链 + Windows SDK 26100，
+    # windows-latest 上没有，别改。
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["x64", "ARM64"]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Skip unselected platform
+        id: gate
+        run: |
+          $wanted = "${{ inputs.platforms }}" -split ',' | ForEach-Object { $_.Trim() }
+          $selected = $wanted -contains "${{ matrix.platform }}"
+          "selected=$($selected.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v7
+        if: steps.gate.outputs.selected == 'true'
+        with:
+          python-version: '3.13'
+
+      - name: Setup Conan
+        if: steps.gate.outputs.selected == 'true'
+        run: pip install conan
+
+      - name: Load Conan cache
+        if: steps.gate.outputs.selected == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.conan2/p
+          key: Conan-${{ hashFiles('src/**/conanfile.txt') }}-ClangCL-${{ matrix.platform }}
+
+      # 与上游 release.yml 一致用 ClangCL（上游正式版就是 ClangCL 产物）。不传 --pfx-path
+      # 即跳过签名。不传 --version-* 时版本号为 0.0.0（Magpie 的「开发版」标识），这正是
+      # 我们要的：避免自编产物冒充某个官方版本号。
+      - name: Build (ClangCL, Release)
+        if: steps.gate.outputs.selected == 'true'
+        run: python scripts/publish.py --compiler=ClangCL --platform=${{ matrix.platform }}
+
+      # 包内元数据：Hibiki 客户端唯一能读到的「这个包是什么」契约面。
+      # configVersion 从 AppSettings.cpp 的 CONFIG_VERSION 现场提取——客户端据此决定
+      # 是否敢写便携标记（schema 漂了就只装不配）。提取不到直接失败，绝不发一个骗人的元数据。
+      - name: Emit hibiki-magpie.json
+        if: steps.gate.outputs.selected == 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "publish/${{ matrix.platform }}"
+          $src = Get-Content src/Magpie/AppSettings.cpp -Raw
+          $m = [regex]::Match($src, 'CONFIG_VERSION\s*=\s*(\d+)\s*;')
+          if (-not $m.Success) { throw 'CONFIG_VERSION not found in src/Magpie/AppSettings.cpp' }
+          $configVersion = [int]$m.Groups[1].Value
+          $upstream = (Get-Content version.json -Raw | ConvertFrom-Json).tag
+          $meta = [ordered]@{
+            upstreamVersion = $upstream
+            forkCommit      = "${{ github.sha }}"
+            forkRepo        = "${{ github.repository }}"
+            configVersion   = $configVersion
+            platform        = "${{ matrix.platform }}"
+            builtAt         = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+          $meta | ConvertTo-Json -Depth 4 | Out-File -FilePath "$out/hibiki-magpie.json" -Encoding utf8
+          Write-Host "configVersion=$configVersion upstream=$upstream"
+
+      # 契约守卫：客户端 magpie_installer.dart 的 kMagpieRequiredRootFiles /
+      # kMagpieRequiredDirs 必须在包里存在，否则客户端装完会判「安装不完整」并回滚。
+      - name: Verify package contents
+        if: steps.gate.outputs.selected == 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "publish/${{ matrix.platform }}"
+          foreach ($f in @('Magpie.exe', 'Microsoft.UI.Xaml.dll', 'resources.pri', 'hibiki-magpie.json')) {
+            if (-not (Test-Path "$out/$f")) { throw "missing required file: $f" }
+          }
+          if (-not (Test-Path "$out/effects")) { throw 'missing required dir: effects' }
+          $effectCount = (Get-ChildItem "$out/effects" -Recurse -File).Count
+          if ($effectCount -lt 100) { throw "effects looks truncated: $effectCount files" }
+          Write-Host "effects files: $effectCount"
+
+      # 打 zip（文件平铺在 zip 根，与上游 release.py 的 make_archive 结构一致）+ sha256 侧车。
+      # 文件名**不含版本号**：固定 tag + 固定文件名 = 客户端永远稳定的直链。
+      - name: Zip + sha256
+        if: steps.gate.outputs.selected == 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zip = "dist/Magpie-hibiki-${{ matrix.platform }}.zip"
+          Compress-Archive -Path "publish/${{ matrix.platform }}/*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$zip.sha256" -Value $hash -NoNewline
+          Write-Host "${{ matrix.platform }} sha256=$hash size=$((Get-Item $zip).Length)"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.gate.outputs.selected == 'true'
+        with:
+          name: Magpie-hibiki-${{ matrix.platform }}
+          path: |
+            dist/Magpie-hibiki-${{ matrix.platform }}.zip
+            dist/Magpie-hibiki-${{ matrix.platform }}.zip.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lR dist
+
+      # 固定 tag `magpie-hibiki` 反复 upsert 同一 release（有则更新、无则创建，同名 asset
+      # 自动覆盖）；prerelease + 非 Latest，绝不干扰上游 fork 的正常 release 视图。
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: magpie-hibiki
+          target_commitish: ${{ github.sha }}
+          name: Magpie for Hibiki
+          body: |
+            Hibiki 自编的 Magpie 产物（本仓库是 Blinue/Magpie 的 GPL-3.0 fork，源码见同一 commit）。
+
+            - fork commit: `${{ github.sha }}`
+            - 上游基线与真实 CONFIG_VERSION 见每个 zip 内的 `hibiki-magpie.json`
+            - 每个 zip 附 `.sha256` 侧车；Hibiki 客户端用它做完整性校验与自更新判据
+            - **未签名**（fork 无签名证书）；Magpie 的 TouchHelper UIAccess 注册因此不可用
+            - 本 release 为 prerelease / 非 Latest，不是上游官方发布
+
+            上游项目：https://github.com/Blinue/Magpie （GPL-3.0）
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: false
+          files: |
+            dist/Magpie-hibiki-*.zip
+            dist/Magpie-hibiki-*.zip.sha256
